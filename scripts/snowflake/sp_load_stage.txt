@@ -1,0 +1,194 @@
+CREATE OR REPLACE PROCEDURE sp_load_stage (TABLE_NAME VARCHAR)
+RETURNS VARCHAR NOT NULL
+LANGUAGE JAVASCRIPT
+AS
+$$
+    // Store the load strategy of table and the respective destination table name from the reference table in a variable to be used later.
+    var ref_cmd = "select * FROM STORE_PROFILE_UAT.LANDING.REFERENCE_TABLE where TABLENAME = " + "'" +TABLE_NAME + "'";
+        var results1 = snowflake.execute({sqlText: ref_cmd});
+        var category = ""
+        while (results1.next()){
+           category = category + results1.getColumnValue('CATEGORY');
+           var dest_table = results1.getColumnValue('DESTINATION_TABLE');
+        }
+    
+    // finds the primary keys of the given input table and stores it in an array.
+
+    var command = "describe table landing." + TABLE_NAME;
+    var result = snowflake.execute({sqlText: command});
+    var primary_keys = [];
+    while (result.next()){
+        if (result.getColumnValue('primary key')=='Y'){
+          primary_keys.push(result.getColumnValue('name'));
+        }
+    }
+    
+    // Forms an array of all the non_primary key columnns which we need to compare in the where clause of updates.  
+
+    var res = snowflake.execute({sqlText: command});
+    var non_pk_list = [];
+    while (res.next()){
+        if (res.getColumnValue('primary key')=='N'){
+            non_pk_list.push(res.getColumnValue('name'));
+        }
+    }
+    
+    // Make an array of columns that are of date data type to make transformations in stage table.
+    var cmd = "desc table stage." + dest_table;
+    var res1 = snowflake.execute({sqlText: cmd})
+    var date_cols = []
+    while (res1.next()){
+        if (res1.getColumnValue("type")=="DATE"){
+            date_cols.push(res1.getColumnValue("name"));
+        }
+    }
+    
+    // Make a string of list of all columns of landing table to be used in select clause of query
+    var desc_land_rslt2 = snowflake.execute({sqlText: command});
+    var land_cols_list = "";
+    while (desc_land_rslt2.next()){
+        // If the column is of date data type, then use a user defined function to change it to required date format.
+        if (date_cols.includes(desc_land_rslt2.getColumnValue('name'))){
+                land_cols_list += "DateFromDay(cast(land.\"" + desc_land_rslt2.getColumnValue('name') + "\" as varchar(20))),";
+        }
+        else{
+            land_cols_list += "land.\"" + desc_land_rslt2.getColumnValue('name') + "\",";
+        }
+    }
+    land_cols_list = land_cols_list.slice(0,-1);
+     
+    // forms the string for the required join condition with primary keys.
+    var index = 0
+    var join_condition = "";
+    while (index < primary_keys.length){
+        // If the column is of date data type, then use a user defined function to change it to required date format.
+        if (date_cols.includes(primary_keys[index])){
+            join_condition = join_condition + "stg." + primary_keys[index] + "=DateFromDay(cast(land." + primary_keys[index] + " as varchar)) and ";
+            index++;
+        }
+        else{
+            join_condition = join_condition + "trim(stg." + primary_keys[index] + ")=trim(land." + primary_keys[index] + ") and ";
+            index++;
+        }
+    }
+    join_condition = join_condition.slice(0, -5);
+    
+    // forms the string for the required where clause for inserts query of type2 load strategy.
+    var index = 0;
+    var where_clause = " ";
+    while (index < primary_keys.length){
+        where_clause = where_clause + "stg." + primary_keys[index] + " is null and ";
+        index++
+    }
+    where_clause_insert = where_clause.slice(0, -5);
+    
+    // Query for inserting into stage table only if the record with that primary keys is not present in the corresponding landing table
+    // Some tables have multiple source tables, check if the destination table name is different than the source table name.
+    if (TABLE_NAME != dest_table){
+        // If yes there is an extra column as source table for those tables.
+        var insert_command = "insert into \"STORE_PROFILE_UAT\".\"STAGE\"." + dest_table + " select " + land_cols_list + ", current_timestamp, NULL, current_timestamp, 'ETL', '" + TABLE_NAME + "' from stage." + dest_table + " stg full outer join landing." + TABLE_NAME + " land on " + join_condition + " where" + where_clause_insert;
+    }
+    else{
+        // Else the table names are same in source(landing schema) and destination (stage schema)
+        var insert_command = "insert into \"STORE_PROFILE_UAT\".\"STAGE\"." + dest_table + " select " + land_cols_list + ", current_timestamp, NULL, current_timestamp, 'ETL' from stage." + dest_table + " stg full outer join landing." + TABLE_NAME + " land on " + join_condition + " where" + where_clause_insert;
+    }
+   
+    // If the load strategy is TYPE 2.   
+    if (category=="TYPE_2"){
+        // Forms the required where clause string to be used in the update query.  
+        var index = 0;
+        var where_clause_update = "";
+        while (index < non_pk_list.length){
+            // If the column is of date data type, then use a user defined function to change it to required date format.
+            if (date_cols.includes(non_pk_list[index])){
+                where_clause_update = where_clause_update + "IFNULL(stg.\"" + non_pk_list[index] + "\", '0')!=IFNULL(DateFromDay(cast(land.\"" + non_pk_list[index] + "\" as varchar)), '0') or ";
+                index++;
+            }
+            else{
+                where_clause_update = where_clause_update + "trim(IFNULL(stg.\"" + non_pk_list[index] + "\", '0'))!=trim(IFNULL(land.\"" + non_pk_list[index] + "\", '0')) or ";
+                index++;
+            }
+        }
+        where_clause_update = where_clause_update.slice(0, -3);
+
+    
+        // identify the deleted records and set their effective_end_date column to current date. These are the records which are present in stage table but not in landing table when compared with primary keys
+        var delete_command = "update \"STORE_PROFILE_UAT\".\"STAGE\"." + dest_table + " stg set stg.EFFECTIVE_END_DATE = current_timestamp, stg.LAST_UPDATED=current_timestamp where not exists (select * from \"STORE_PROFILE_UAT\".\"LANDING\"." + TABLE_NAME + " land where " + join_condition + ") and stg.EFFECTIVE_END_DATE is null";
+
+    
+        // updates the effective_end_date of previous record to current date. These are the records which are present in both tables when compared with primary keys but there is a change in atleast one non primary key columns.
+        var updt_cmd = "update \"STORE_PROFILE_UAT\".\"STAGE\"." + dest_table + " stg set stg.EFFECTIVE_END_DATE=current_timestamp, stg.LAST_UPDATED=current_timestamp where exists (select * from \"STORE_PROFILE_UAT\".\"LANDING\"." + TABLE_NAME + " land where (" + join_condition + ") and (" + where_clause_update + "))  and stg.EFFECTIVE_END_DATE is null";
+        
+        // Inserts those newe records with changes occured as the latest record (with EFFECTIVE_END_DATE as null)
+        // Some tables have multiple source tables, check if the destination table name is different than the source table name.
+        if (TABLE_NAME != dest_table){
+            // If yes there is an extra column as source table for those tables.
+            var updt_inst_cmd = "insert into \"STORE_PROFILE_UAT\".\"STAGE\"." + dest_table + " select " + land_cols_list + ", current_timestamp, NULL, current_timestamp, 'ETL', '" + TABLE_NAME + "' from \"STORE_PROFILE_UAT\".\"STAGE\"." + TABLE_NAME + " stg inner join \"STORE_PROFILE_UAT\".\"LANDING\"." + TABLE_NAME + " land on " + join_condition + " where (" + where_clause_update + ") and (stg.EFFECTIVE_END_DATE is null)";
+        }
+        else{
+            // Else the table names are same in source(landing schema) and destination (stage schema)
+            var updt_inst_cmd = "insert into \"STORE_PROFILE_UAT\".\"STAGE\"." + dest_table + " select " + land_cols_list + ", current_timestamp, NULL, current_timestamp, 'ETL' from \"STORE_PROFILE_UAT\".\"STAGE\"." + TABLE_NAME + " stg inner join \"STORE_PROFILE_UAT\".\"LANDING\"." + TABLE_NAME + " land on " + join_condition + " where (" + where_clause_update + ") and (stg.EFFECTIVE_END_DATE is null)";
+        }
+        try{
+            // Executing all these statements in this order will load the stage table according to TYPE 2 load strategy.
+            snowflake.execute({sqlText: delete_command});
+            snowflake.execute({sqlText: updt_inst_cmd});
+            snowflake.execute({sqlText: updt_cmd});
+            snowflake.execute({sqlText: insert_command});
+            var result = "TYPE_2 SUCCESSFUL";
+        }
+        catch (err) {
+            // Catch if there is any error executing the above statements and display the error message.
+            var result = "TYPE_2 Failed: " + err.message.replace(/\n/g, " ");
+        }
+    return result;
+    }
+    else{
+        // Forms the string for setting all the non primary key columns of stage to landing values.
+        var index = 0;
+        var set_updt = "";
+        while (index<non_pk_list.length){
+            // If the column is of date data type, then use a user defined function to change it to required date format.
+            if (date_cols.includes(non_pk_list[index])){
+                set_updt = set_updt + "stg.\"" + non_pk_list[index] + "\"=DateFromDay(cast(land.\"" + non_pk_list[index] + "\" as varchar(20))),";
+                index++;
+              }
+            else{
+                set_updt = set_updt + "stg.\"" + non_pk_list[index] + "\"=land.\"" + non_pk_list[index] + "\",";
+                index++;
+            }
+        }
+        set_updt = set_updt.slice(0,-1);
+        
+        // Query for inserting into a stage table which doesn't have primary keys. In such case the records are directly inserted in the stage table.
+        // Some tables have multiple source tables, check if the destination table name is different than the source table name.
+        if (TABLE_NAME != dest_table){
+            // If yes there is an extra column as source table for those tables.
+            var inst_cmd = "insert into \"STORE_PROFILE_UAT\".\"STAGE\"." + dest_table + " select " + land_cols_list + ", current_timestamp, NULL, current_timestamp, 'ETL', '" + TABLE_NAME + "' from landing." + TABLE_NAME + " land"
+        }
+        else{
+            // Else the table names are same in source(landing schema) and destination (stage schema)
+            var inst_cmd = "insert into \"STORE_PROFILE_UAT\".\"STAGE\"." + dest_table + " select " + land_cols_list + ", current_timestamp, NULL, current_timestamp, 'ETL' from landing." + TABLE_NAME + " land"
+        }
+        
+        // Merge statement for directly updating the non primary key columns when matched.
+        var upsert_cmd = "merge into \"STORE_PROFILE_UAT\".\"STAGE\"." + dest_table + " stg using \"STORE_PROFILE_UAT\".\"LANDING\"." + TABLE_NAME + " land on " + join_condition + " when matched then update set " + set_updt + ",stg.LAST_UPDATED=current_timestamp";
+        try{
+            // Check if a table has a primary key.
+            if (primary_keys.length == 0){
+                // If not execute this statement
+                snowflake.execute({sqlText: inst_cmd});
+            }
+            else{
+                snowflake.execute({sqlText: upsert_cmd});
+                snowflake.execute({sqlText: insert_command});
+            }
+            var result = "SUCCESSFUL";
+        }
+        catch (err) {
+            // Catch if there is any error executing the above statements and display the error message.
+            var result = "Failed: " + err.message.replace(/\n/g, " ");
+        }
+     return result;
+     }
+$$
